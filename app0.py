@@ -7,12 +7,12 @@
 
 # --- API Key ---
 # Add your OpenRouter API key here to enable the AI model
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = "sk-or-v1-"
 
 # --- WordPress Site Configuration ---
-WORDPRESS_URL = "https://kytisa.com/"
-WORDPRESS_USER = "agent"
-WORDPRESS_APP_PASSWORD = "ZcG6 lOEs pOje 4NEy qFrG bEeQ"
+WORDPRESS_URL = "https://yourwebsite.com/"
+WORDPRESS_USER = "user"
+WORDPRESS_APP_PASSWORD = "Key"
 
 # --- RAG System Optimization ---
 CONTEXT_FOR_LLM_COUNT = 10      # Number of parent documents to send to the LLM
@@ -500,4 +500,5 @@ if __name__ == '__main__':
         print(f"Starting Flask server at http://0.0.0.0:5011")
         print(f"To start full WordPress ingestion, run: python3 {script_name} wp")
         print(f"To ingest a single post by ID, run: python3 {script_name} wp-single <POST_ID>")
+
         app.run(host='0.0.0.0', port=5011, debug=False)
