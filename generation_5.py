@@ -126,6 +126,9 @@ Pour CHAQUE source, fournir une ligne structurée:
 - **Arrêté:** [Réf] — [Objet] — [URL]
 IMPORTANT: Séparer textes OHADA et textes guinéens. Citer Loi ET son Décret d'application si présents.
 Ne citer comme fondement juridique QUE les textes qui apparaissent réellement dans le CONTEXTE ou les SOURCES IDENTIFIÉES. Si aucun texte précis n'est disponible pour répondre entièrement à la question, l'indiquer explicitement (par exemple: "Les références exactes aux dispositions antérieures ne figurent pas dans les documents indexés").
+
+**CONFIANCE:**
+[Score entre 0.0 et 1.0 évaluant la certitude juridique de la réponse basée uniquement sur les sources fournies]
 """
 
         return prompt
@@ -259,25 +262,69 @@ class ResponseFormatter:
     def extract_sections(response: str) -> Dict:
         """Extract structured sections from response"""
         sections = {}
-        
-        # Extract main response
-        response_match = re.search(r'\*\*RÉPONSE:\*\*\s*(.*?)\s*\*\*FONDEMENT', response, re.DOTALL)
+        if not response or not isinstance(response, str):
+            return sections
+
+        # 1. Extract main response
+        response_match = re.search(
+            r'(?:(?:\*\*|#{1,6}\s*|\*)|(?:^|\r?\n)[ \t]*)R[EÉ]PONSE\b\*{0,2}[ \t]*:?[ \t]*\*{0,2}[ \t]*(?:\r?\n)?\s*'
+            r'(.*?)'
+            r'(?=(?:\r?\n|[ \t]+(?=\*\*|#{1,6}))[ \t]*(?:'
+            r'(?:\*\*|#{1,6}\s*|\*)?(?:FONDEMENT(?:\s+JURIDIQUE)?|CONFIANCE)\b(?:\*{0,2}[ \t]*:|\*{1,2}[ \t]*(?:\r?\n|[-+0-9\[]))'
+            r'|(?:FONDEMENT(?:\s+JURIDIQUE)?|CONFIANCE)\b[ \t]*:'
+            r')|\Z)',
+            response,
+            re.DOTALL | re.IGNORECASE
+        )
         if response_match:
             sections['response'] = response_match.group(1).strip()
-        
-        # Extract legal basis
-        basis_match = re.search(r'\*\*FONDEMENT JURIDIQUE:\*\*\s*(.*?)\s*\*\*CONFIANCE', response, re.DOTALL)
+
+        # 2. Extract legal basis cleanly up to CONFIANCE header or end-of-string
+        basis_match = re.search(
+            r'(?:(?:\*\*|#{1,6}\s*|\*)|(?:^|\r?\n)[ \t]*)FONDEMENT(?:\s+JURIDIQUE)?\b\*{0,2}[ \t]*:?[ \t]*\*{0,2}[ \t]*(?:\r?\n)?\s*'
+            r'(.*?)'
+            r'(?=(?:\r?\n|[ \t]+(?=\*\*|#{1,6}))[ \t]*(?:'
+            r'(?:\*\*|#{1,6}\s*|\*)?CONFIANCE\b(?:\*{0,2}[ \t]*:|\*{1,2}[ \t]*(?:\r?\n|[-+0-9\[]))'
+            r'|CONFIANCE\b[ \t]*:'
+            r')|\Z)',
+            response,
+            re.DOTALL | re.IGNORECASE
+        )
         if basis_match:
             sections['legal_basis'] = basis_match.group(1).strip()
-        
-        # Extract confidence
-        confidence_match = re.search(r'\*\*CONFIANCE:\*\*\s*([\d.]+)', response)
+
+        # 3. Extract confidence score with brackets, percentages, negatives, fractions, and robust 0.5 fallback
+        confidence_match = re.search(
+            r'(?:(?:\*\*|#{1,6}\s*|\*)|(?:^|\r?\n)[ \t]*)CONFIANCE\b'
+            r'(?:\*{0,2}[ \t]*:[ \t]*\*{0,2}|\*{1,2}[ \t]*(?:\r?\n|$))'
+            r'[ \t\r\n]*\[?\*?\*?\s*([^\s\n()\]*]+(?:[ \t]*%)?)',
+            response,
+            re.IGNORECASE
+        )
         if confidence_match:
-            try:
-                sections['confidence'] = float(confidence_match.group(1))
-            except ValueError:
-                sections['confidence'] = 0.5
-        
+            val = confidence_match.group(1).strip().strip("[]*")
+            is_pct = val.endswith('%')
+            clean_val = val.rstrip('%').strip().replace(',', '.')
+
+            if '/' in clean_val:
+                parts = clean_val.split('/')
+                try:
+                    score = float(parts[0]) / float(parts[1])
+                except Exception:
+                    score = 0.5
+            else:
+                try:
+                    score = float(clean_val)
+                    import math
+                    if math.isnan(score) or math.isinf(score):
+                        score = 0.5
+                    elif is_pct:
+                        score = score / 100.0
+                except ValueError:
+                    score = 0.5
+
+            sections['confidence'] = min(1.0, max(0.0, score))
+
         return sections
     
     @staticmethod
@@ -309,7 +356,7 @@ class ResponseFormatter:
         # In agentic mode the confidence is computed separately by
         # LegalReasonerAgent and injected into metadata — not in the text.
         # Downgrade to INFO so it doesn't trigger a validation failure.
-        if 'CONFIANCE' not in response:
+        if not re.search(r'confiance', response, re.IGNORECASE):
             issues.append("[INFO] Confidence score not found in answer text")
         
         # Check for uncertainty indicators (informational only — not a validation failure).

@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from typing import Any, Dict, List, Optional, TypedDict
 
 # --------------------------------------------------------------------------- #
@@ -48,6 +49,27 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================================== #
+# Helper: Future Resolution                                                     #
+# =========================================================================== #
+
+def _resolve_future(fut_or_val: Any, default: Any = None) -> Any:
+    """
+    Safely resolve a concurrent.futures.Future or return the value if already resolved.
+    Catches and logs exceptions, returning default on failure.
+    """
+    if fut_or_val is None:
+        return default
+    if hasattr(fut_or_val, "result"):
+        try:
+            res = fut_or_val.result()
+            return res if res is not None else default
+        except Exception as e:
+            logger.warning(f"Error resolving future: {e}")
+            return default
+    return fut_or_val
+
+
+# =========================================================================== #
 # Shared State                                                                  #
 # =========================================================================== #
 
@@ -61,6 +83,12 @@ class AgentState(TypedDict, total=False):
     use_cache:      bool
     use_graph:      bool
 
+    # Pre-warming futures & resolved results (Contract C)
+    prewarm_seed_vec:    Optional[Any]  # Future or List[Dict] (seed vector search)
+    prewarm_title_ref:   Optional[Any]  # Future or List[Dict] (title reference search)
+    prewarm_bm25:        Optional[Any]  # Future or List[Dict] (BM25 sparse search)
+    prewarm_plan:        Optional[Any]  # Future or Dict (query analysis plan)
+
     # Router output
     complexity:     str        # "simple" | "complex" | "multi-doc"
     complexity_score: float    # 0-1
@@ -69,9 +97,11 @@ class AgentState(TypedDict, total=False):
     # Graph navigator output
     graph_doc_ids:  List[str]  # candidate doc_ids from Neo4j traversal
 
-    # Vector specialist output
-    vector_results: List[Dict]  # raw vector + BM25 results
-    queries:        List[str]   # original + expanded variants
+    # Vector specialist output (Contract C)
+    vector_result_lists: List[List[Dict]]  # independent ranked lists for multi-list RRF
+    vector_results:      List[Dict]        # flat list for backward compatibility
+    queries:             List[str]         # original + expanded variants
+    metadata_filters:    Dict[str, Any]
 
     # Temporal analyst output
     temporal_filter: Optional[Dict[str, Any]]  # e.g. {'year': 2023}
@@ -120,6 +150,7 @@ class RouterAgent:
     Classifies query complexity (simple / complex / multi-doc) using GPT-4o-mini.
     Detects legal entities mentioned in the query.
     Decides which downstream path the StateGraph follows.
+    Concurrently pre-warms seed vector, title reference, and BM25 searches on shared pool.
     """
 
     SYSTEM_PROMPT = (
@@ -138,13 +169,67 @@ class RouterAgent:
         "ATTENTION: Toute requête mentionnant un arrêt, un jugement, une affaire ou un numéro de décision DOIT être classée comme 'complex'."
     )
 
-    def __init__(self, client: OpenAI):
+    def __init__(
+        self,
+        client: OpenAI,
+        retriever: Optional[HybridRetriever] = None,
+        pool: Optional[ThreadPoolExecutor] = None,
+    ):
         self.client = client
+        self.retriever = retriever
+        self.pool = pool
 
     def run(self, state: AgentState) -> AgentState:
         t0 = time.time()
         query = state["query"]
+        filters = state.get("filters")
+        pool = self.pool or state.get("_pool")
 
+        # ── Launch concurrent pre-warming on shared thread pool ─── #
+        fut_seed_vec = None
+        fut_title_ref = None
+        fut_bm25 = None
+
+        if pool is not None and self.retriever is not None:
+            # 1. Seed vector search (Dense Top K)
+            try:
+                fut_seed_vec = pool.submit(
+                    self.retriever.vector_search,
+                    query,
+                    top_k=config.DENSE_TOP_K,
+                    filters=filters,
+                )
+            except Exception as e:
+                logger.warning(f"RouterAgent: failed to submit prewarm vector_search: {e}")
+
+            # 2. Title reference search (top_k=5 for exact reference match)
+            try:
+                fut_title_ref = pool.submit(
+                    self.retriever.title_reference_search,
+                    query,
+                    top_k=5,
+                )
+            except Exception as e:
+                logger.warning(f"RouterAgent: failed to submit prewarm title_reference_search: {e}")
+
+            # 3. BM25 sparse search
+            if getattr(config, "BM25_ENABLED", True):
+                try:
+                    fut_bm25 = pool.submit(
+                        self.retriever.bm25_search,
+                        query,
+                        top_k=config.BM25_TOP_K,
+                    )
+                except Exception as e:
+                    logger.warning(f"RouterAgent: failed to submit prewarm bm25_search: {e}")
+
+        # Set prewarm futures immediately on state
+        state["prewarm_seed_vec"] = fut_seed_vec
+        state["prewarm_title_ref"] = fut_title_ref
+        state["prewarm_bm25"] = fut_bm25
+        state["prewarm_plan"] = None
+
+        # ── LLM classification executes concurrently on main thread ── #
         try:
             resp = self.client.chat.completions.create(
                 model=config.SIMPLE_QUERY_MODEL,
@@ -184,7 +269,7 @@ class RouterAgent:
         state["complexity"]       = complexity
         state["complexity_score"] = complexity_score
         state["legal_entities"]   = legal_entities
-        _trace(state, "RouterAgent", t0, f"{complexity} (score={complexity_score:.2f}) | {reason}")
+        _trace(state, "RouterAgent", t0, f"{complexity} (score={complexity_score:.2f}) [prewarmed] | {reason}")
         logger.info(f"[Router] complexity={complexity} score={complexity_score:.2f} entities={legal_entities}")
         return state
 
@@ -197,33 +282,55 @@ class GraphNavigatorAgent:
     """
     Explores Neo4j for documents related to the detected legal entities.
     Builds a candidate doc_id set used by the Vector Specialist.
+    Concurrently starts query analysis on thread pool and reuses prewarmed seed vector search.
     """
 
-    def __init__(self, retriever: HybridRetriever):
+    def __init__(self, retriever: HybridRetriever, pool: Optional[ThreadPoolExecutor] = None):
         self.retriever = retriever
+        self.pool = pool
 
     def run(self, state: AgentState) -> AgentState:
         t0 = time.time()
         entities  = state.get("legal_entities", [])
         filters   = state.get("filters")
         query     = state["query"]
+        use_graph = state.get("use_graph", True)
+        pool      = self.pool or state.get("_pool")
+
+        # 1. Asynchronously dispatch analyze_query to thread pool as prewarm_plan
+        if state.get("prewarm_plan") is None and pool is not None:
+            try:
+                state["prewarm_plan"] = pool.submit(self.retriever.analyze_query, query)
+                logger.debug("[GraphNavigator] Dispatched analyze_query to thread pool")
+            except Exception as e:
+                logger.warning(f"GraphNavigator: failed to submit prewarm analyze_query: {e}")
 
         graph_doc_ids: List[str] = []
 
         try:
-            # First get an initial set of doc_ids via a quick vector search
-            init_results = self.retriever.vector_search(
-                query,
-                top_k=config.DENSE_TOP_K,
-                filters=filters,
-            )
-            seed_doc_ids = list({r["doc_id"] for r in init_results})
+            # 2. Consume pre-warmed seed vector search or fallback to fresh search
+            init_results = _resolve_future(state.get("prewarm_seed_vec"), default=None)
+            if init_results is None:
+                init_results = self.retriever.vector_search(
+                    query,
+                    top_k=config.DENSE_TOP_K,
+                    filters=filters,
+                )
 
-            # Expand via graph traversal
-            expanded = self.retriever.graph_expansion(seed_doc_ids)
-            graph_doc_ids = expanded
+            # Store resolved List[Dict] back into state so VectorSpecialist can reuse it without re-running
+            state["prewarm_seed_vec"] = init_results
+
+            seed_doc_ids = list({r["doc_id"] for r in init_results if r.get("doc_id")})
+
+            # 3. Expand via graph traversal (Contract A: get_related_documents_batch via retriever)
+            if use_graph and config.GRAPH_EXPANSION_ENABLED and seed_doc_ids:
+                expanded = self.retriever.graph_expansion(seed_doc_ids)
+                graph_doc_ids = expanded
+            else:
+                graph_doc_ids = seed_doc_ids
+
             notes = (
-                f"seed={len(seed_doc_ids)} -> expanded={len(expanded)} doc_ids "
+                f"seed={len(seed_doc_ids)} -> expanded={len(graph_doc_ids)} doc_ids "
                 f"| entities={entities}"
             )
         except Exception as e:
@@ -244,161 +351,203 @@ class GraphNavigatorAgent:
 class VectorSpecialistAgent:
     """
     Runs query expansion, parallel vector search, and BM25 sparse search.
-    Produces a combined (unmerged) list of result lists for the Fusion agent.
+    Reuses pre-warmed searches from Router and GraphNavigator.
+    Batch-embeds all query variants with embed_queries_batch in a single call.
+    Produces both vector_result_lists (for multi-list RRF) and vector_results (flat).
     """
 
-    def __init__(self, retriever: HybridRetriever):
+    def __init__(self, retriever: HybridRetriever, pool: Optional[ThreadPoolExecutor] = None):
         self.retriever = retriever
+        self.pool = pool
 
     def run(self, state: AgentState) -> AgentState:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         t0      = time.time()
         query   = state["query"]
         filters = state.get("filters")
+        pool    = self.pool or state.get("_pool")
 
-        # 1 & 2 & 3. Concurrent Query analysis, dense search, and BM25
         result_lists: List[List[Dict]] = []
         graph_doc_ids = state.get("graph_doc_ids", [])
-        
-        with ThreadPoolExecutor() as pool:
-            # 0. Title/reference search — exact doc match (arrêt 173/2021, etc.)
-            title_ref_future = pool.submit(self.retriever.title_reference_search, query, top_k=15)
-            # 1. Start exact vector search immediately
-            exact_vec_future = pool.submit(self.retriever.vector_search, query, top_k=config.DENSE_TOP_K, filters=filters)
-            
-            # Collect title/reference first (highest priority for RRF)
-            try:
-                title_ref = title_ref_future.result()
-                if title_ref:
-                    result_lists.insert(0, title_ref)
-            except Exception as e:
-                logger.warning(f"Title/reference search failed: {e}")
-            # Wait for exact_vec_results to get seed_doc_ids for graph expansion
-            try:
-                exact_vec_results = exact_vec_future.result()
-                result_lists.append(exact_vec_results)
-            except Exception as e:
-                logger.warning(f"Vector search failed: {e}")
-                exact_vec_results = []
-                
-            # 2. Launch graph expansion IMMEDIATELY now that we have exact_vec_results
-            graph_future = None
+
+        # 1. Resolve pre-warmed seed vector results (already resolved by GraphNavigator)
+        prewarm_seed = state.get("prewarm_seed_vec")
+        exact_vec_results: List[Dict] = _resolve_future(prewarm_seed, default=[])
+        if not exact_vec_results:
+            if pool is not None:
+                try:
+                    exact_vec_results = pool.submit(self.retriever.vector_search, query, top_k=config.DENSE_TOP_K, filters=filters).result()
+                except Exception as e:
+                    logger.warning(f"Vector search failed: {e}")
+                    exact_vec_results = []
+            else:
+                exact_vec_results = self.retriever.vector_search(query, top_k=config.DENSE_TOP_K, filters=filters)
+
+        # 2. Resolve pre-warmed title/reference search
+        prewarm_title = state.get("prewarm_title_ref")
+        title_ref: List[Dict] = _resolve_future(prewarm_title, default=[])
+        if not title_ref and prewarm_title is None:
+            if pool is not None:
+                try:
+                    title_ref = pool.submit(self.retriever.title_reference_search, query, top_k=15).result()
+                except Exception as e:
+                    logger.warning(f"Title/reference search failed: {e}")
+            else:
+                try:
+                    title_ref = self.retriever.title_reference_search(query, top_k=15)
+                except Exception as e:
+                    logger.warning(f"Title/reference search failed: {e}")
+
+        # Ensure source tags on title_ref and exact_vec
+        for r in title_ref:
+            if "source" not in r:
+                r["source"] = "title_reference"
+
+        if title_ref:
+            result_lists.append(title_ref)
+
+        if exact_vec_results:
+            for r in exact_vec_results:
+                if "source" not in r:
+                    r["source"] = "vector"
+            result_lists.append(exact_vec_results)
+
+        # 3. Launch graph search on expanded documents immediately on pool
+        graph_future = None
+        local_pool = None
+        exec_pool = pool
+        if exec_pool is None:
+            local_pool = ThreadPoolExecutor(max_workers=8)
+            exec_pool = local_pool
+
+        try:
             if graph_doc_ids and config.GRAPH_EXPANSION_ENABLED:
-                seed_doc_ids = {r["doc_id"] for r in exact_vec_results}
+                seed_doc_ids = {r["doc_id"] for r in exact_vec_results if r.get("doc_id")}
                 graph_only   = [d for d in graph_doc_ids if d not in seed_doc_ids]
                 if graph_only:
-                    graph_future = pool.submit(self.retriever.search_expanded_documents, query, graph_only, top_k=8)
+                    graph_future = exec_pool.submit(self.retriever.search_expanded_documents, query, graph_only, top_k=8)
 
-            # 3. Start LLM Analysis and base BM25
-            bm25_future = pool.submit(self.retriever.bm25_search, query, top_k=config.BM25_TOP_K) if config.BM25_ENABLED else None
-            analysis_future = pool.submit(self.retriever.analyze_query, query)
-            
-            try:
-                plan = analysis_future.result()
-            except Exception as e:
-                logger.warning(f"Query analysis failed: {e}")
-                plan = {"sub_queries": [], "hyde_document": "", "keywords": []}
-                
-            queries = [query]
-            if plan.get("sub_queries"):
-                queries.extend(plan["sub_queries"])
-            if plan.get("hyde_document"):
-                queries.append(plan["hyde_document"])
+            # 4. Resolve pre-warmed base BM25 search
+            bm25_future = None
+            bm25_res: List[Dict] = []
+            prewarm_bm25 = state.get("prewarm_bm25")
+            if prewarm_bm25 is not None:
+                bm25_res = _resolve_future(prewarm_bm25, default=[])
+            elif config.BM25_ENABLED:
+                bm25_future = exec_pool.submit(self.retriever.bm25_search, query, top_k=config.BM25_TOP_K)
+
+            # 5. Resolve pre-warmed query analysis plan
+            plan = _resolve_future(state.get("prewarm_plan"), default=None)
+            if plan is None:
+                try:
+                    plan = self.retriever.analyze_query(query)
+                except Exception as e:
+                    logger.warning(f"Query analysis failed: {e}")
+                    plan = {"sub_queries": [], "hyde_document": "", "keywords": []}
+
+            state["prewarm_plan"] = plan
+
+            # 6. Collect all query variants: [query] + sub_queries + ([hyde] if hyde else [])
+            sub_queries = [sq for sq in plan.get("sub_queries", []) if sq and isinstance(sq, str) and sq.strip()]
+            hyde = plan.get("hyde_document", "")
+            hyde_doc = [hyde.strip()] if (hyde and isinstance(hyde, str) and hyde.strip()) else []
+            queries = [query] + sub_queries + hyde_doc
             state["queries"] = queries
-            
+
+            # 7. Batch-embed all query variants in a single OpenAI call (Contract B)
+            if hasattr(self.retriever, "embed_queries_batch") and queries:
+                try:
+                    self.retriever.embed_queries_batch(queries)
+                except Exception as e:
+                    logger.warning(f"Batch embedding failed: {e}")
+
+            # 8. Submit variant vector & BM25 searches on thread pool
             variant_futures = []
             bm25_variant_futures = []
-            
-            for sq in plan.get("sub_queries", []):
-                if sq and isinstance(sq, str):
-                    variant_futures.append(pool.submit(self.retriever.vector_search, sq, top_k=config.DENSE_TOP_K, filters=filters))
-                    if config.BM25_ENABLED:
-                        bm25_variant_futures.append(pool.submit(self.retriever.bm25_search, sq, top_k=config.BM25_TOP_K))
-            
-            hyde = plan.get("hyde_document", "")
-            if hyde and isinstance(hyde, str):
-                variant_futures.append(pool.submit(self.retriever.vector_search, hyde, top_k=config.DENSE_TOP_K, filters=filters))
-                
+
+            for sq in sub_queries:
+                variant_futures.append(exec_pool.submit(self.retriever.vector_search, sq, top_k=config.DENSE_TOP_K, filters=filters))
+                if config.BM25_ENABLED:
+                    bm25_variant_futures.append(exec_pool.submit(self.retriever.bm25_search, sq, top_k=config.BM25_TOP_K))
+
+            if hyde_doc:
+                variant_futures.append(exec_pool.submit(self.retriever.vector_search, hyde_doc[0], top_k=config.DENSE_TOP_K, filters=filters))
+
             keywords = plan.get("keywords", [])
             if keywords and config.BM25_ENABLED and isinstance(keywords, list):
                 kw_str = " ".join(str(k) for k in keywords)
-                if kw_str:
-                    bm25_variant_futures.append(pool.submit(self.retriever.bm25_search, kw_str, top_k=config.BM25_TOP_K))
-                
-            # exact_vec_future was already retrieved early
-            
+                if kw_str.strip():
+                    bm25_variant_futures.append(exec_pool.submit(self.retriever.bm25_search, kw_str, top_k=config.BM25_TOP_K))
+
+            # Await exact BM25 if deferred
+            if bm25_future:
+                try:
+                    bm25_res = bm25_future.result()
+                except Exception as e:
+                    logger.warning(f"Exact BM25 search failed: {e}")
+
+            if bm25_res:
+                for r in bm25_res:
+                    if "source" not in r:
+                        r["source"] = "bm25"
+                result_lists.append(bm25_res)
+
+            # Await variant vector searches
             for fut in as_completed(variant_futures):
                 try:
                     res = fut.result()
                     if res:
+                        for r in res:
+                            if "source" not in r:
+                                r["source"] = "vector"
                         result_lists.append(res)
                 except Exception as e:
                     logger.warning(f"VectorSpecialist variant failed: {e}")
-                    
-            if bm25_future:
+
+            # Await variant BM25 searches
+            for fut in as_completed(bm25_variant_futures):
                 try:
-                    bm25_res = bm25_future.result()
-                    if bm25_res:
-                        result_lists.append(bm25_res)
-                except Exception as e:
-                    logger.warning(f"Exact BM25 search failed: {e}")
-                    
-            for future in as_completed(bm25_variant_futures):
-                try:
-                    res = future.result()
+                    res = fut.result()
                     if res:
+                        for r in res:
+                            if "source" not in r:
+                                r["source"] = "bm25"
                         result_lists.append(res)
                 except Exception as e:
                     logger.warning(f"Variant BM25 search failed: {e}")
 
-            # 4. Await Graph results
+            # Await graph search
             if graph_future:
                 try:
                     graph_res = graph_future.result()
                     if graph_res:
+                        for r in graph_res:
+                            if "source" not in r:
+                                r["source"] = "graph_expansion"
                         result_lists.append(graph_res)
                 except Exception as e:
                     logger.warning(f"Graph search failed: {e}")
 
-        # Extract local metadata filters from Query Analyzer
+        finally:
+            if local_pool is not None:
+                local_pool.shutdown(wait=True)
+
+        # 9. Extract metadata filters from plan
         metadata_filters = plan.get("metadata_filters", {}) if plan else {}
         logger.info(f"VectorSpecialist metadata_filters extracted: {metadata_filters}")
-        
-        def _is_title_match(query_title: str, doc_title: str) -> bool:
-            import re
-            stopwords = {"les", "des", "sur", "pour", "dans", "aux", "par", "une", "est", "qui", "que", "avec"}
-            def get_words(text):
-                text = re.sub(r'[^\w\s\']', ' ', text.lower())
-                return [w for w in text.split() if len(w) > 2 and w not in stopwords]
-            
-            q_words = get_words(query_title)
-            if not q_words:
-                return True
-                
-            d_words = set(get_words(doc_title))
-            
-            if len(q_words) > 0 and q_words[0] not in d_words:
-                return False
-            if len(q_words) > 1 and q_words[1] not in d_words:
-                return False
-                
-            matches = sum(1 for w in q_words if w in d_words)
-            return (matches / len(q_words)) >= 0.4
-            
-        # Flatten into a single list for further processing. 
-        # DEPRECATED: Hard local metadata filtering was too restrictive.
-        # We now rely on the FusionReranker and LegalReasoner to determine relevance.
+
+        # 10. Populate state with multi-list results AND flat results (Contract C)
+        state["vector_result_lists"] = [lst for lst in result_lists if lst]
+
         all_results: List[Dict] = []
         for lst in result_lists:
             for res in lst:
-                # Add source tag if missing
                 if "source" not in res:
-                    res["source"] = "vector" # Default
+                    res["source"] = "vector"
                 all_results.append(res)
-                
+
         state["vector_results"] = all_results
         state["metadata_filters"] = metadata_filters
-        logger.info(f"VectorSpecialist collected {len(all_results)} total chunks (filtering removed)")
+        logger.info(f"VectorSpecialist collected {len(all_results)} total chunks across {len(result_lists)} lists")
 
         total = sum(len(l) for l in result_lists)
         _trace(state, "VectorSpecialistAgent", t0,
@@ -471,40 +620,64 @@ class FusionRerankerAgent:
         query   = state["query"]
         top_k   = state.get("top_k", config.FINAL_TOP_K)
 
-        # Re-group vector_results by source for RRF (we kept them flat — wrap)
-        raw       = state.get("vector_results", [])
-        # Deduplicate into a single list first, then treat as one RRF input.
-        # When the same chunk_id appears with different source tags (e.g.
-        # "vector" AND "graph_expansion"), prefer "graph_expansion" because
-        # the graph relationship is the more informative attribution.
-        seen_ids: dict = {}   # chunk_id -> index in unique list
-        unique: List[Dict] = []
-        for r in raw:
-            cid = r["chunk_id"]
-            if cid not in seen_ids:
-                seen_ids[cid] = len(unique)
-                unique.append(r)
-            else:
-                # Already seen — upgrade source if this one is graph_expansion
-                existing = unique[seen_ids[cid]]
-                if r.get("source") == "graph_expansion" and existing.get("source") != "graph_expansion":
-                    existing["source"] = "graph_expansion"
+        # ── 1. Multi-list RRF (Contract C) ────────────────────────────────── #
+        # VectorSpecialistAgent supplies independent ranked lists in vector_result_lists
+        result_lists = state.get("vector_result_lists")
+        if not result_lists:
+            # Fallback for backward compatibility or when vector_result_lists is not set
+            raw = state.get("vector_results", [])
+            result_lists = [raw] if raw else []
 
-        # Run RRF (single list → no-op fusion, preserves order by score)
-        fused = self.retriever.reciprocal_rank_fusion([unique])
+        # Filter out empty lists
+        active_lists = [lst for lst in result_lists if lst]
 
-        # Apply soft temporal boosting if detected
+        # ── 2. Track source tags to preserve provenance across RRF ───────── #
+        graph_chunk_ids = set()
+        title_ref_chunk_ids = set()
+        for lst in active_lists:
+            for chunk in lst:
+                cid = chunk.get("chunk_id")
+                src = chunk.get("source")
+                if src == "graph_expansion":
+                    graph_chunk_ids.add(cid)
+                elif src == "title_reference":
+                    title_ref_chunk_ids.add(cid)
+
+        # Also inspect flat vector_results if present
+        for chunk in state.get("vector_results", []):
+            cid = chunk.get("chunk_id")
+            src = chunk.get("source")
+            if src == "graph_expansion":
+                graph_chunk_ids.add(cid)
+            elif src == "title_reference":
+                title_ref_chunk_ids.add(cid)
+
+        # ── 3. Execute Reciprocal Rank Fusion ─────────────────────────────── #
+        if active_lists:
+            fused = self.retriever.reciprocal_rank_fusion(active_lists)
+        else:
+            fused = []
+
+        # ── 4. Restore high-value source tags on fused chunks ─────────────── #
+        for chunk in fused:
+            cid = chunk.get("chunk_id")
+            if cid in graph_chunk_ids:
+                chunk["source"] = "graph_expansion"
+            elif cid in title_ref_chunk_ids and chunk.get("source") != "graph_expansion":
+                chunk["source"] = "title_reference"
+
+        # ── 5. Apply soft temporal boosting if detected ───────────────────── #
         temporal_filter = state.get("temporal_filter")
         if temporal_filter and "year" in temporal_filter:
             target_year = str(temporal_filter["year"])
             for chunk in fused:
-                chunk_year = str(chunk.get("metadata", {}).get("year", ""))
+                m = chunk.get("metadata", {}) or {}
+                chunk_year = str(m.get("year", ""))
                 if chunk_year == target_year:
-                    # Small boost to score for RRF/Rerank priority
-                    chunk["rrf_score"] = chunk.get("rrf_score", 0.1) * 1.2 
+                    chunk["rrf_score"] = chunk.get("rrf_score", 0.1) * 1.2
             logger.info(f"[FusionReranker] Applied soft boost for year {target_year}")
 
-        # Apply strong title/reference boosting — exact doc match gets highest priority
+        # ── 6. Apply title/reference boosting (exact doc match) ───────────── #
         import re
         q_lower = query.lower()
         refs = re.findall(r"\b\d+/\d{4}\b", q_lower)
@@ -515,33 +688,34 @@ class FusionRerankerAgent:
         ref_boost_count = 0
         title_boost_count = 0
         for chunk in fused:
-            m = chunk.get("metadata", {})
+            m = chunk.get("metadata", {}) or {}
             doc_title = str(m.get("doc_title", "")).lower()
             reference = str(m.get("reference", "")).lower()
             title_ref = doc_title + " " + reference
-            # Strong boost (4x) if reference (173/2021) in title or reference
             if refs and any(r in title_ref for r in refs):
                 chunk["rrf_score"] = chunk.get("rrf_score", 0.1) * 4.0
                 ref_boost_count += 1
-            # Strong boost (3.5x) if doc_title filter matches
             elif title_filters and any(str(tf).lower() in doc_title for tf in title_filters if tf):
                 chunk["rrf_score"] = chunk.get("rrf_score", 0.1) * 3.5
                 title_boost_count += 1
         if ref_boost_count or title_boost_count:
             logger.info(f"[FusionReranker] Applied boosts: ref={ref_boost_count}, title={title_boost_count}")
 
-        # Re-sort after all boosts to ensure boosted chunks are in the top-N for reranking
+        # Re-sort after all boosts to ensure boosted chunks are in top-N for reranking
         fused.sort(key=lambda x: x.get("rrf_score", 0.0), reverse=True)
 
-        # LLM reranking
+        # ── 7. LLM reranking ─────────────────────────────────────────────── #
         reranked = self.retriever.rerank_with_llm(query, fused, top_k=top_k)
 
-        # When query has exact reference, promote matching chunks to top (exact sources first)
+        # ── 8. Exact reference promotion ──────────────────────────────────── #
         if refs:
             matching = [r for r in reranked if r.get("source") == "title_reference"]
-            matching += [r for r in reranked if r.get("source") != "title_reference" and
-                any(ref in (str(r.get("metadata", {}).get("doc_title", "")) + " " +
-                    str(r.get("metadata", {}).get("reference", ""))).lower() for ref in refs)]
+            matching += [
+                r for r in reranked
+                if r.get("source") != "title_reference"
+                and any(ref in (str((r.get("metadata", {}) or {}).get("doc_title", "")) + " " +
+                                str((r.get("metadata", {}) or {}).get("reference", ""))).lower() for ref in refs)
+            ]
             matching = list({c["chunk_id"]: c for c in matching}.values())
             non_matching = [r for r in reranked if r["chunk_id"] not in {c["chunk_id"] for c in matching}]
             if matching:
@@ -549,18 +723,10 @@ class FusionRerankerAgent:
                 reranked = reranked[:top_k]
                 logger.info(f"[FusionReranker] Promoted {len(matching)} exact-match chunks to top")
 
-        # Resolve cross-references to ensure cited articles are in the context
-        reranked = self.retriever._resolve_cross_references(reranked, max_refs=4)
-
-        # ── Guarantee minimum graph slots ────────────────────────────────── #
-        # The LLM reranker often prefers vector results (higher text-level
-        # relevance) and drops all graph_expansion results.  To ensure the
-        # graph actually contributes to  answers, promote the best graph
-        # results into the final set when the reranker didn't include enough.
+        # ── 9. Guarantee minimum graph slots ──────────────────────────────── #
         MIN_GRAPH_SLOTS = 2
         graph_in_reranked = [r for r in reranked if r.get("source") == "graph_expansion"]
         if len(graph_in_reranked) < MIN_GRAPH_SLOTS:
-            # Grab best graph results from the full fused list (sorted by RRF)
             graph_candidates = [
                 r for r in fused
                 if r.get("source") == "graph_expansion"
@@ -569,15 +735,18 @@ class FusionRerankerAgent:
             needed = MIN_GRAPH_SLOTS - len(graph_in_reranked)
             to_add = graph_candidates[:needed]
             if to_add:
-                # Replace the lowest-scoring non-graph results
                 for g in to_add:
-                    # Find lowest-scoring non-graph result to replace
+                    # Find lowest-scoring non-graph result to replace, preserving exact reference matches
                     non_graph = [
                         (i, r) for i, r in enumerate(reranked)
-                        if r.get("source") != "graph_expansion"
+                        if r.get("source") != "graph_expansion" and r.get("source") != "title_reference"
                     ]
+                    if not non_graph:
+                        non_graph = [
+                            (i, r) for i, r in enumerate(reranked)
+                            if r.get("source") != "graph_expansion"
+                        ]
                     if non_graph:
-                        # Replace the last non-graph entry (lowest priority)
                         replace_idx = non_graph[-1][0]
                         reranked[replace_idx] = g
                 logger.info(
@@ -585,28 +754,36 @@ class FusionRerankerAgent:
                     f"into top-{top_k} (min_graph_slots={MIN_GRAPH_SLOTS})"
                 )
 
+        # ── 10. Enforce cross-reference resolution in RAM ─────────────────── #
+        # Positioned after graph slot guarantee so cross-ref chunks are never displaced
+        try:
+            reranked = self.retriever._resolve_cross_references(reranked, max_refs=4)
+        except Exception as e:
+            logger.warning(f"[FusionReranker] Cross-reference resolution failed (non-fatal): {e}")
+
         state["fused_results"] = reranked
 
-        # Build context string
+        # ── 11. Build context string ──────────────────────────────────────── #
         context_parts = []
         for i, chunk in enumerate(reranked, 1):
-            m = chunk["metadata"]
+            m = chunk.get("metadata", {}) or {}
             header_parts = [m.get("doc_title", "Sans titre")]
             if m.get("type"):        header_parts.append(f"type={m['type']}")
             if m.get("reference"):   header_parts.append(f"ref={m['reference']}")
             if m.get("year"):        header_parts.append(f"annee={m['year']}")
             if m.get("institution"): header_parts.append(f"inst={m['institution']}")
-            if m.get("date"):        header_parts.append(f"date={m['date'][:10]}")
+            if m.get("date"):        header_parts.append(f"date={str(m['date'])[:10]}")
             context_parts.append(
                 f"[Document {i}] {' | '.join(header_parts)}\n"
-                f"{chunk['content']}\n"
+                f"{chunk.get('content', '')}\n"
                 f"Source: {m.get('source_url', 'N/A')}"
             )
 
-        state["context"]       = "\n\n---\n\n".join(context_parts)
+        state["context"] = "\n\n---\n\n".join(context_parts)
+        num_fused = len(fused)
         _trace(state, "FusionRerankerAgent", t0,
-               f"RRF {len(unique)} -> reranked -> top {len(reranked)}")
-        logger.info(f"[FusionReranker] {len(unique)} unique -> top {len(reranked)}")
+               f"RRF {len(active_lists)} lists ({num_fused} unique) -> reranked -> top {len(reranked)}")
+        logger.info(f"[FusionReranker] {len(active_lists)} lists ({num_fused} unique) -> top {len(reranked)}")
         return state
 
 

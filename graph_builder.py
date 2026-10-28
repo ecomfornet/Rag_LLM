@@ -2,11 +2,12 @@
 Graph Builder Module - Neo4j Integration
 Handles graph construction, relationship extraction, and Neo4j operations
 """
+import os
 import logging
 import re
 from typing import List, Dict, Tuple, Optional
 from neo4j import GraphDatabase
-from neo4j.exceptions import ServiceUnavailable
+from neo4j.exceptions import ServiceUnavailable, ConnectionAcquisitionTimeoutError, DriverError
 import config
 
 logger = logging.getLogger(__name__)
@@ -29,10 +30,41 @@ class GraphBuilder:
     """Manages Neo4j graph database operations"""
     
     def __init__(self):
-        """Initialize Neo4j connection"""
+        """Initialize Neo4j connection with configured connection pool"""
+        # Connection pool tuning with robust fallback (Requirement R3)
+        try:
+            raw_pool = getattr(config, "NEO4J_MAX_CONNECTION_POOL_SIZE", None)
+            if raw_pool is None:
+                raw_pool = os.getenv("NEO4J_MAX_CONNECTION_POOL_SIZE", "50")
+            max_pool_size = int(raw_pool)
+            if max_pool_size <= 0:
+                logger.warning(f"Invalid NEO4J_MAX_CONNECTION_POOL_SIZE ({max_pool_size}), falling back to 50")
+                max_pool_size = 50
+        except (ValueError, TypeError):
+            logger.warning("Unparseable NEO4J_MAX_CONNECTION_POOL_SIZE, falling back to 50")
+            max_pool_size = 50
+
+        try:
+            raw_timeout = getattr(config, "NEO4J_CONNECTION_ACQUISITION_TIMEOUT", None)
+            if raw_timeout is None:
+                raw_timeout = os.getenv("NEO4J_CONNECTION_ACQUISITION_TIMEOUT", "15.0")
+            acq_timeout = float(raw_timeout)
+            if acq_timeout <= 0:
+                logger.warning(f"Invalid NEO4J_CONNECTION_ACQUISITION_TIMEOUT ({acq_timeout}), falling back to 15.0")
+                acq_timeout = 15.0
+        except (ValueError, TypeError):
+            logger.warning("Unparseable NEO4J_CONNECTION_ACQUISITION_TIMEOUT, falling back to 15.0")
+            acq_timeout = 15.0
+
+        self.max_connection_pool_size = max_pool_size
+        self.connection_acquisition_timeout = acq_timeout
+        self._is_closed = False
+
         self.driver = GraphDatabase.driver(
             config.NEO4J_URI,
-            auth=(config.NEO4J_USER, config.NEO4J_PASSWORD)
+            auth=(config.NEO4J_USER, config.NEO4J_PASSWORD),
+            max_connection_pool_size=self.max_connection_pool_size,
+            connection_acquisition_timeout=self.connection_acquisition_timeout,
         )
         self._verify_connectivity()
         self._create_constraints()
@@ -47,8 +79,11 @@ class GraphBuilder:
             with self.driver.session(database=config.NEO4J_DATABASE) as session:
                 session.run("RETURN 1")
             logger.info("Neo4j connection verified")
-        except ServiceUnavailable as e:
-            logger.error(f"Cannot connect to Neo4j: {e}")
+        except (ServiceUnavailable, ConnectionAcquisitionTimeoutError, DriverError) as e:
+            logger.error(f"Cannot connect to Neo4j ({type(e).__name__}): {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error during Neo4j connectivity check: {e}")
             raise
     
     def _create_constraints(self):
@@ -439,6 +474,73 @@ class GraphBuilder:
         
         logger.debug(f"Found {len(related_docs)} related documents for {doc_id}")
         return related_docs
+
+    def get_related_documents_batch(
+        self,
+        doc_ids: List[str],
+        relationship_types: Optional[List[str]] = None,
+        max_depth: int = 2
+    ) -> Dict[str, int]:
+        """
+        Batch traverse graph for multiple seed documents using a single UNWIND Cypher query.
+        Returns a dict mapping doc_id -> minimum_hop_distance across all seeds.
+        Implements Contract A (graph_builder.py -> retrieval_4.py) and Requirement R3.
+
+        Args:
+            doc_ids: List of seed document IDs to expand from
+            relationship_types: Types of relationships to traverse (defaults to config.GRAPH_RELATIONSHIP_TYPES)
+            max_depth: Maximum traversal depth (clamped between 1 and 3)
+
+        Returns:
+            Dict[str, int]: Mapping of document ID to minimum hop distance (e.g. {'doc_123': 1, 'doc_456': 2})
+        """
+        if not doc_ids:
+            return {}
+
+        # 1. Clean, deduplicate, and validate seed document IDs
+        unique_doc_ids = list(dict.fromkeys(
+            str(d).strip() for d in doc_ids if d is not None and str(d).strip()
+        ))
+        if not unique_doc_ids:
+            return {}
+
+        # 2. Resolve and filter relationship types against allowlist and database
+        relationship_types = relationship_types or getattr(config, "GRAPH_RELATIONSHIP_TYPES", ["CITES"])
+        valid_types = self._filter_relationship_types(relationship_types)
+
+        if not valid_types:
+            logger.debug(f"No valid relationship types to traverse for doc_ids {unique_doc_ids}")
+            return {}
+
+        # 3. Sanitize max_depth
+        try:
+            clean_depth = int(max_depth)
+        except (ValueError, TypeError):
+            clean_depth = 2
+        clean_depth = max(1, min(3, clean_depth))
+
+        rel_pattern = "|".join(valid_types)
+
+        # 4. Construct single UNWIND Cypher query with min(length(path)) aggregation
+        query = f"""
+        UNWIND $doc_ids AS seed_id
+        MATCH path = (d:Document {{id: seed_id}})-[r:{rel_pattern}*1..{clean_depth}]-(related:Document)
+        RETURN related.id AS doc_id, min(length(path)) AS min_distance
+        """
+
+        distance_map: Dict[str, int] = {}
+        try:
+            with self.driver.session(database=config.NEO4J_DATABASE) as session:
+                result = session.run(query, doc_ids=unique_doc_ids)
+                for record in result:
+                    distance_map[record["doc_id"]] = int(record["min_distance"])
+        except (ConnectionAcquisitionTimeoutError, ServiceUnavailable) as e:
+            logger.error(f"Neo4j connection error during batch graph traversal: {e}")
+        except Exception as e:
+            logger.error(f"Error getting related documents batch: {e}")
+
+        logger.debug(f"Found {len(distance_map)} related documents across {len(unique_doc_ids)} seed docs")
+        return distance_map
     
     def document_exists(self, doc_id: str) -> bool:
         """
@@ -585,8 +687,25 @@ class GraphBuilder:
         self._existing_rel_types = None
         logger.info("Relationship type cache invalidated")
 
+    def __enter__(self):
+        """Support context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Support context manager exit by cleanly closing connection pool."""
+        self.close()
+
     def close(self):
-        """Close Neo4j connection"""
-        if self.driver:
-            self.driver.close()
-            logger.info("Neo4j connection closed")
+        """Close Neo4j connection and release pool resources (idempotent)."""
+        if getattr(self, "_is_closed", False):
+            logger.debug("GraphBuilder is already closed")
+            return
+
+        if hasattr(self, "driver") and self.driver is not None:
+            try:
+                self.driver.close()
+                logger.info("Neo4j connection pool closed")
+            except Exception as e:
+                logger.warning(f"Error while closing Neo4j driver: {e}")
+            finally:
+                self._is_closed = True
