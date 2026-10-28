@@ -22,8 +22,9 @@ if [ -z "$1" ]; then
     echo "============================================================"
     exec python main.py -i
 else
+    QUERY="$*"
     echo "============================================================"
-    echo " Query: $1"
+    echo " Query: $QUERY"
     echo "============================================================"
-    exec python main.py -q "$@"
+    exec python main.py -q "$QUERY"
 fi
