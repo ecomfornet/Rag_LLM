@@ -7,7 +7,7 @@ import config
 
 load_dotenv()
 
-client = QdrantClient(host="localhost", port=6340)
+client = QdrantClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT, api_key=config.QDRANT_API_KEY)
 
 url = "https://kytisa.com/cour-dappel-de-kankan-chambre-du-premier-president-arret-n-004-du-11-janvier-2017/"
 

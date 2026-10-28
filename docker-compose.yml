@@ -7,6 +7,7 @@ services:
       - "7475:7474" # HTTP
       - "7688:7687" # Bolt
     environment:
+      - QDRANT__SERVICE__API_KEY=graphrag_secure_2026
       - NEO4J_AUTH=neo4j/graphrag123
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_dbms_security_procedures_unrestricted=apoc.*
@@ -24,6 +25,8 @@ services:
     ports:
       - "6340:6333" # HTTP API
       - "6341:6334" # gRPC
+    environment:
+      - QDRANT__SERVICE__API_KEY=graphrag_secure_2026
     volumes:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped

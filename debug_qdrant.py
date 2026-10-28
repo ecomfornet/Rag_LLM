@@ -3,7 +3,7 @@ from qdrant_client import QdrantClient
 import config
 
 try:
-    client = QdrantClient(host="localhost", port=config.QDRANT_PORT)
+    client = QdrantClient(host="localhost", port=config.QDRANT_PORT, api_key=config.QDRANT_API_KEY)
     attrs = dir(client)
     print("Client attributes count:", len(attrs))
     
