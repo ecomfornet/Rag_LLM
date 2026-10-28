@@ -172,6 +172,8 @@ class HybridRetriever:
         # In-process caches to avoid repeated expensive DB scans
         # ref_key -> list[chunks]
         self._title_ref_cache: Dict[str, List[Dict]] = {}
+        # query_str -> analyzed plan dict
+        self._query_plan_cache: Dict[str, Dict] = {}
 
         logger.info("HybridRetriever initialized")
 
@@ -579,6 +581,11 @@ class HybridRetriever:
         if not config.QUERY_EXPANSION_ENABLED:
             return {"sub_queries": [], "hyde_document": "", "keywords": [], "metadata_filters": {}}
 
+        norm_key = query.strip().lower()
+        if hasattr(self, "_query_plan_cache") and norm_key in self._query_plan_cache:
+            logger.debug(f"Query analysis cache hit for: {norm_key[:40]}")
+            return self._query_plan_cache[norm_key]
+
         # Fast path: exact reference queries (e.g. CCJA N°173/2021) do NOT need
         # an LLM analysis. This saves an entire OpenAI round-trip and typically
         # improves precision by focusing retrieval on the requested decision.
@@ -586,7 +593,7 @@ class HybridRetriever:
         if refs:
             ref = refs[0]
             # Provide metadata_filters in the same shape expected downstream.
-            return {
+            plan = {
                 "sub_queries": [],
                 "hyde_document": "",
                 "keywords": [],
@@ -595,6 +602,9 @@ class HybridRetriever:
                     "doc_title": ["CCJA", "arrêt", ref],
                 },
             }
+            if hasattr(self, "_query_plan_cache"):
+                self._query_plan_cache[norm_key] = plan
+            return plan
             
         # FIX 8: improved prompt to extract exact document references as metadata filters
         prompt = f"""Tu es un expert en droit OHADA, droit guinéen et jurisprudence CCJA.
@@ -613,12 +623,14 @@ Question: {query}
                 model=config.SIMPLE_QUERY_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=800,
+                max_tokens=400,
                 response_format={"type": "json_object"}
             )
             import json
             plan = json.loads(resp.choices[0].message.content)
             logger.debug(f"Query analysis plan: {plan}")
+            if hasattr(self, "_query_plan_cache"):
+                self._query_plan_cache[norm_key] = plan
             return plan
         except Exception as e:
             logger.warning(f"Query analysis failed: {e}")
@@ -1265,6 +1277,17 @@ Format de r\u00e9ponse : Uniquement les num\u00e9ros des {top_k} extraits les pl
             for k, v in extracted_metadata.items():
                 filters[k] = v
 
+        # Collect variant queries and batch-embed in one OpenAI call
+        sub_queries = [sq for sq in plan.get("sub_queries", []) if sq and isinstance(sq, str)]
+        hyde = plan.get("hyde_document", "")
+        hyde_doc = [hyde.strip()] if (hyde and isinstance(hyde, str) and hyde.strip()) else []
+        all_variants = [query] + sub_queries + hyde_doc
+        if hasattr(self, "embed_queries_batch") and all_variants:
+            try:
+                self.embed_queries_batch(all_variants)
+            except Exception as e:
+                logger.warning(f"Batch embedding in retrieve() failed: {e}")
+
         with ThreadPoolExecutor() as pool:
             # Title/reference search first — fetches docs matching query ref (e.g. arrêt 173/2021)
             title_ref_future = pool.submit(self.title_reference_search, query, top_k=15)
@@ -1277,11 +1300,10 @@ Format de r\u00e9ponse : Uniquement les num\u00e9ros des {top_k} extraits les pl
             bm25_variant_futures = []
             
             # Sub-queries: both Vector and BM25
-            for sq in plan.get("sub_queries", []):
-                if sq and isinstance(sq, str):
-                    variant_futures.append(pool.submit(self.vector_search, sq, top_k=config.DENSE_TOP_K, filters=filters))
-                    if config.BM25_ENABLED:
-                        bm25_variant_futures.append(pool.submit(self.bm25_search, sq, top_k=config.BM25_TOP_K))
+            for sq in sub_queries:
+                variant_futures.append(pool.submit(self.vector_search, sq, top_k=config.DENSE_TOP_K, filters=filters))
+                if config.BM25_ENABLED:
+                    bm25_variant_futures.append(pool.submit(self.bm25_search, sq, top_k=config.BM25_TOP_K))
             
             # HyDE Document: Vector search only (hallucinated text confuses BM25)
             hyde = plan.get("hyde_document", "")

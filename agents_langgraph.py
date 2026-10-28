@@ -223,11 +223,19 @@ class RouterAgent:
                 except Exception as e:
                     logger.warning(f"RouterAgent: failed to submit prewarm bm25_search: {e}")
 
+            # 4. Advanced Query Plan (HyDE + Sub-queries) executed concurrently with router LLM
+            fut_plan = None
+            if getattr(config, "QUERY_EXPANSION_ENABLED", True):
+                try:
+                    fut_plan = pool.submit(self.retriever.analyze_query, query)
+                except Exception as e:
+                    logger.warning(f"RouterAgent: failed to submit prewarm analyze_query: {e}")
+
         # Set prewarm futures immediately on state
         state["prewarm_seed_vec"] = fut_seed_vec
         state["prewarm_title_ref"] = fut_title_ref
         state["prewarm_bm25"] = fut_bm25
-        state["prewarm_plan"] = None
+        state["prewarm_plan"] = fut_plan
 
         # ── LLM classification executes concurrently on main thread ── #
         try:
@@ -453,30 +461,33 @@ class VectorSpecialistAgent:
             queries = [query] + sub_queries + hyde_doc
             state["queries"] = queries
 
-            # 7. Batch-embed all query variants in a single OpenAI call (Contract B)
-            if hasattr(self.retriever, "embed_queries_batch") and queries:
-                try:
-                    self.retriever.embed_queries_batch(queries)
-                except Exception as e:
-                    logger.warning(f"Batch embedding failed: {e}")
-
-            # 8. Submit variant vector & BM25 searches on thread pool
-            variant_futures = []
+            # 7. Submit BM25 variant searches immediately (in-memory CPU/RAM, zero embeddings needed)
             bm25_variant_futures = []
-
             for sq in sub_queries:
-                variant_futures.append(exec_pool.submit(self.retriever.vector_search, sq, top_k=config.DENSE_TOP_K, filters=filters))
                 if config.BM25_ENABLED:
                     bm25_variant_futures.append(exec_pool.submit(self.retriever.bm25_search, sq, top_k=config.BM25_TOP_K))
-
-            if hyde_doc:
-                variant_futures.append(exec_pool.submit(self.retriever.vector_search, hyde_doc[0], top_k=config.DENSE_TOP_K, filters=filters))
 
             keywords = plan.get("keywords", [])
             if keywords and config.BM25_ENABLED and isinstance(keywords, list):
                 kw_str = " ".join(str(k) for k in keywords)
                 if kw_str.strip():
                     bm25_variant_futures.append(exec_pool.submit(self.retriever.bm25_search, kw_str, top_k=config.BM25_TOP_K))
+
+            # 8. Batch-embed all query variants in a single OpenAI call (Contract B)
+            # While OpenAI embedding call runs over the network, BM25 searches are already completing!
+            if hasattr(self.retriever, "embed_queries_batch") and queries:
+                try:
+                    self.retriever.embed_queries_batch(queries)
+                except Exception as e:
+                    logger.warning(f"Batch embedding failed: {e}")
+
+            # 9. Submit variant vector searches now that embeddings are cached
+            variant_futures = []
+            for sq in sub_queries:
+                variant_futures.append(exec_pool.submit(self.retriever.vector_search, sq, top_k=config.DENSE_TOP_K, filters=filters))
+
+            if hyde_doc:
+                variant_futures.append(exec_pool.submit(self.retriever.vector_search, hyde_doc[0], top_k=config.DENSE_TOP_K, filters=filters))
 
             # Await exact BM25 if deferred
             if bm25_future:
@@ -812,7 +823,13 @@ class LegalReasonerAgent:
 
     # ------------------------------------------------------------------ #
     def _parse_confidence(self, answer: str) -> float:
-        m = re.search(r"\*\*CONFIANCE:\*\*\s*([0-9.]+)", answer)
+        try:
+            sec = ResponseFormatter.extract_sections(answer)
+            if "confidence" in sec and sec["confidence"] is not None:
+                return float(sec["confidence"])
+        except Exception:
+            pass
+        m = re.search(r"\*\*CONFIANCE:\*\*\s*\[?([0-9.]+)", answer)
         if m:
             try:
                 return min(1.0, max(0.0, float(m.group(1))))
@@ -931,9 +948,41 @@ class SimpleFastPath:
         filters = state.get("filters")
 
         try:
-            chunks, context = self.retriever.retrieve_with_context(
-                query=query, top_k=top_k, filters=filters, use_graph=False
-            )
+            # Fast path: reuse pre-warmed searches already launched by RouterAgent
+            prewarm_seed = state.get("prewarm_seed_vec")
+            prewarm_bm25 = state.get("prewarm_bm25")
+            prewarm_title = state.get("prewarm_title_ref")
+
+            if prewarm_seed is not None or prewarm_bm25 is not None:
+                seed_res = _resolve_future(prewarm_seed, default=[])
+                bm25_res = _resolve_future(prewarm_bm25, default=[])
+                title_res = _resolve_future(prewarm_title, default=[])
+
+                candidate_lists = []
+                if title_res:
+                    candidate_lists.append(title_res)
+                if seed_res:
+                    candidate_lists.append(seed_res)
+                if bm25_res:
+                    candidate_lists.append(bm25_res)
+
+                if candidate_lists:
+                    fused = self.retriever.reciprocal_rank_fusion(candidate_lists)
+                else:
+                    fused = []
+
+                chunks = fused[:top_k]
+                context_parts = []
+                for i, c in enumerate(chunks, 1):
+                    m = c.get("metadata", {}) or {}
+                    context_parts.append(
+                        f"[Document {i}] {m.get('doc_title', 'Sans titre')}\n{c.get('content', '')}"
+                    )
+                context = "\n\n---\n\n".join(context_parts)
+            else:
+                chunks, context = self.retriever.retrieve_with_context(
+                    query=query, top_k=top_k, filters=filters, use_graph=False
+                )
             llm_result = self.generator.generate_response(query, context, chunks=chunks)
         except Exception as e:
             logger.error(f"SimpleFastPath error: {e}")
