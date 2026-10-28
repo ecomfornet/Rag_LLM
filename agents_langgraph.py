@@ -202,12 +202,12 @@ class RouterAgent:
             except Exception as e:
                 logger.warning(f"RouterAgent: failed to submit prewarm vector_search: {e}")
 
-            # 2. Title reference search (top_k=5 for exact reference match)
+            # 2. Title reference search (top_k=15 for exact reference match)
             try:
                 fut_title_ref = pool.submit(
                     self.retriever.title_reference_search,
                     query,
-                    top_k=5,
+                    top_k=15,
                 )
             except Exception as e:
                 logger.warning(f"RouterAgent: failed to submit prewarm title_reference_search: {e}")
@@ -1085,10 +1085,13 @@ class AgenticPipeline:
         self.formatter = ResponseFormatter()
         self.cache     = CacheManager()
 
+        # Shared persistent thread pool (12 workers for parallel agent orchestration)
+        self._pool = ThreadPoolExecutor(max_workers=12, thread_name_prefix="teamworker")
+
         # Instantiate agents
-        self._router    = RouterAgent(self.client)
-        self._navigator = GraphNavigatorAgent(self.retriever)
-        self._vector    = VectorSpecialistAgent(self.retriever)
+        self._router    = RouterAgent(self.client, retriever=self.retriever, pool=self._pool)
+        self._navigator = GraphNavigatorAgent(self.retriever, pool=self._pool)
+        self._vector    = VectorSpecialistAgent(self.retriever, pool=self._pool)
         self._temporal  = TemporalAnalystAgent()
         self._fusion    = FusionRerankerAgent(self.retriever)
         self._reasoner  = LegalReasonerAgent(self.generator, self.retriever)
@@ -1143,6 +1146,7 @@ class AgenticPipeline:
             "use_cache":    use_cache,
             "use_graph":    use_graph,
             "agent_trace":  [],
+            "_pool":        self._pool,
         }
 
         # ── Run LangGraph ────────────────────────────────────────────────── #
@@ -1168,6 +1172,17 @@ class AgenticPipeline:
 
         total_ms = (time.time() - start_time) * 1000
 
+        # Compute breakdown across retrieval vs generation stages
+        retrieval_ms = 0.0
+        generation_ms = 0.0
+        for step in final_state.get("agent_trace", []):
+            agent_name = step.get("agent", "")
+            step_lat = float(step.get("latency_ms", 0.0))
+            if agent_name in ("LegalReasonerAgent", "SimpleFastPath"):
+                generation_ms += step_lat
+            else:
+                retrieval_ms += step_lat
+
         response = {
             "query":   question,
             "answer":  answer,
@@ -1181,7 +1196,11 @@ class AgenticPipeline:
                 "model":    llm_result.get("model", config.LLM_MODEL),
                 "usage":    llm_result.get("usage", {}),
                 "cost_usd": cost,
-                "latency_ms": {"total": total_ms},
+                "latency_ms": {
+                    "total": round(total_ms, 2),
+                    "retrieval": round(retrieval_ms, 2),
+                    "generation": round(generation_ms, 2),
+                },
                 "num_chunks":    len(chunks),
                 "graph_enabled": use_graph,
                 "filters_used":  filters or {},
@@ -1241,7 +1260,12 @@ class AgenticPipeline:
 
     # ---------------------------------------------------------------------- #
     def close(self):
-        """Close all underlying connections."""
+        """Close all underlying connections and worker pool."""
+        try:
+            if hasattr(self, "_pool") and self._pool is not None:
+                self._pool.shutdown(wait=False)
+        except Exception as e:
+            logger.warning(f"Error shutting down thread pool: {e}")
         self.retriever.close()
         if hasattr(self.retriever, "graph_builder") and self.retriever.graph_builder:
             self.retriever.graph_builder.close()
