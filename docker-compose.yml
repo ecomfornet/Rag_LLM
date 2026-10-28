@@ -1,0 +1,46 @@
+services:
+  # Neo4j Graph Database
+  neo4j:
+    image: neo4j:5.14-community
+    container_name: graphrag_neo4j
+    ports:
+      - "7475:7474" # HTTP
+      - "7688:7687" # Bolt
+    environment:
+      - NEO4J_AUTH=neo4j/graphrag123
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=2G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    restart: unless-stopped
+
+  # Qdrant Vector Database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: graphrag_qdrant
+    ports:
+      - "6340:6333" # HTTP API
+      - "6341:6334" # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: graphrag_redis
+    ports:
+      - "6380:6379"
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  qdrant_data:
+  redis_data:

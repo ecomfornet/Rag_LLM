@@ -1,0 +1,14 @@
+{
+  "timestamp": "20260313_110823",
+  "project": "GraphRAG Legal Documents",
+  "export_mode": "native_snapshots",
+  "stats": {
+    "qdrant_snapshot": "exports\\graphrag_full_migration_20260313_110823\\db\\legal_docs_graphrag.snapshot",
+    "neo4j_dump": "exports\\graphrag_full_migration_20260313_110823\\db\\neo4j_database.dump",
+    "redis_keys": 3
+  },
+  "environment": {
+    "qdrant_collection": "legal_docs_graphrag",
+    "neo4j_db": "neo4j"
+  }
+}

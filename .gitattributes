@@ -1,2 +1,7 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Ensure shell scripts always keep Unix LF line endings
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+docker-compose.yml text eol=lf
+.gitignore text eol=lf
+.env.example text eol=lf

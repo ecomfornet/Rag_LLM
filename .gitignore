@@ -1,0 +1,48 @@
+# ==============================================================================
+# GraphRAG .gitignore
+# ==============================================================================
+
+# Secrets and environment configurations (NEVER COMMIT)
+.env
+*.env
+!.env.example
+
+# Large Database Snapshots and Dumps (Exceeds GitHub 100MB limit)
+db/
+*.snapshot
+*.dump
+*.rdb
+*.tar.gz
+*.zip
+BACKUP_MANIFEST.json
+SHA256SUMS
+
+# Processed Data, Embeddings, BM25 Caches (>100MB)
+data/
+*.pkl
+bm25_cache.pkl
+
+# Python virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Runtime state & logs
+logs/
+*.log
+.restored
+tmp/
+
+# OS & IDE metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

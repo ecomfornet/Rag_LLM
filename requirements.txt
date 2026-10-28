@@ -1,0 +1,48 @@
+# Core dependencies
+openai>=1.35.0
+python-dotenv>=1.0.0
+
+# Graph database
+neo4j>=5.14.0
+
+# Vector database
+qdrant-client>=1.7.0
+
+# Caching
+redis>=5.0.0
+faiss-cpu>=1.7.4
+
+# Data processing
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+requests>=2.31.0
+numpy>=1.24.0
+
+# Text processing — BM25 retrieval (planned feature)
+rank-bm25>=0.2.2
+
+# Utilities
+tqdm>=4.66.0
+pydantic>=2.0.0
+tenacity>=8.2.0
+
+# Web server
+flask>=3.0.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# ── Multi-Agent Orchestration (LangGraph) ─────────────────────────────────
+langgraph>=0.1.0
+langchain-openai>=0.1.0
+langchain-core>=0.1.0
+
+# ── Removed unused packages ───────────────────────────────────────────────
+# The following were in requirements but are NOT imported anywhere:
+#   spacy>=3.7.0              (~500MB) — not used
+#   transformers>=4.35.0      (~1GB)   — not used
+#   torch>=2.0.0              (~2GB)   — not used
+#   sentence-transformers     (~500MB) — not used
+#   nltk>=3.8.0               — not used
+#   pandas>=2.0.0             — not used
