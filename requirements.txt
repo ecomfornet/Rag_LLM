@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Core dependencies
 openai>=1.35.0
 python-dotenv>=1.0.0
@@ -46,3 +47,24 @@ langchain-core>=0.1.0
 #   sentence-transformers     (~500MB) — not used
 #   nltk>=3.8.0               — not used
 #   pandas>=2.0.0             — not used
+=======
+# --- Flask Web Server ---
+Flask~=3.0.0
+
+# --- HTTP Requests ---
+requests~=2.31.0
+
+# --- Document Processing ---
+PyPDF2~=3.0.1
+python-docx~=1.1.2 # Library for .docx files, imported as 'docx'
+
+# --- Core AI & Machine Learning Libraries ---
+# Installs the CPU-only version of PyTorch by default
+torch~=2.3.1
+sentence-transformers~=3.0.1
+langchain~=0.2.1 # For the RecursiveCharacterTextSplitter
+
+# --- Search & Vector Database ---
+rank-bm25~=0.2.2 # For keyword search
+chromadb~=0.5.3 # Vector database
+>>>>>>> 1b61182362d1b4af459f8eae2e467198053f8399

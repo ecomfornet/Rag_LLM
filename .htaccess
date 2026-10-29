@@ -1,0 +1,12 @@
+# Active le moteur de réécriture d'URL
+RewriteEngine On
+
+# Les modules proxy doivent être disponibles et activés par votre hébergeur
+<IfModule mod_proxy.c>
+    <IfModule mod_proxy_http.c>
+        # Réécriture de toutes les requêtes vers le serveur Flask
+        # On utilise le port 5005, qui est le port sur lequel votre application est en cours d'exécution
+        # 'P' pour Proxy, 'L' pour Last (dernière règle)
+        RewriteRule ^(.*)$ http://127.0.0.1:5011/$1 [P,L]
+    </IfModule>
+</IfModule>
